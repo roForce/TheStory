@@ -28,7 +28,7 @@ def _load_minimax_credentials() -> tuple[str, str]:
     return creds["access_token"], creds["base_url"]
 
 
-def call_minimax(prompt: str, system: Optional[str] = None, max_tokens: int = 2000) -> str:
+def call_minimax(prompt: str, system: Optional[str] = None, max_tokens: int = 1800) -> str:
     """调用 MiniMax M2.7（Anthropic 兼容格式），返回文本"""
     key, base_url = _load_minimax_credentials()
 
@@ -41,11 +41,10 @@ def call_minimax(prompt: str, system: Optional[str] = None, max_tokens: int = 20
         "model": "MiniMax-M2.7",
         "messages": messages,
         "max_tokens": max_tokens,
-        "thinking": {"type": "disabled"},
     }
 
     curl_cmd = [
-        "curl", "-s", "--max-time", "180",
+        "curl", "-s", "--max-time", "150",
         "-X", "POST",
         f"{base_url}/v1/messages",
         "-H", f"Authorization: Bearer {key}",
@@ -55,7 +54,7 @@ def call_minimax(prompt: str, system: Optional[str] = None, max_tokens: int = 20
     ]
 
     try:
-        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=200)
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=160)
         if result.returncode != 0:
             print(f"[LLM] curl failed: {result.stderr[:100]}")
             return ""
@@ -64,7 +63,6 @@ def call_minimax(prompt: str, system: Optional[str] = None, max_tokens: int = 20
         for block in content:
             if block.get("type") == "text":
                 return block["text"]
-        # fallback: 尝试直接从 resp 提取
         return ""
     except subprocess.TimeoutExpired:
         print("[LLM] MiniMax 调用超时")
@@ -77,24 +75,38 @@ def call_minimax(prompt: str, system: Optional[str] = None, max_tokens: int = 20
 def generate_long_text(prompt: str, system: Optional[str] = None, min_chars: int = 4000) -> str:
     """
     生成长文本（多段拼接），确保达到最低字数
-    MiniMax M2.7 单次 max_tokens=2000（约1500-2000中文字），分3次调用
+    MiniMax M2.7 单次约1000-2100中文字，分2-3次调用
     """
-    target_chars = max(min_chars, 4500)
+    target_chars = max(min_chars, 4200)
     chunks = []
-    remaining_chars = target_chars + 500
 
-    max_calls = 4
-    for i in range(max_calls):
-        # 追加提示，让模型继续写
-        continuation = "" if i == 0 else "\n\n[请继续上述内容，自然衔接，延续剧情]"
-        text = call_minimax(prompt + continuation, system, max_tokens=MAX_TOKENS_PER_CALL)
-        if not text or len(text.strip()) < 20:
-            break
-        chunks.append(text)
-        prompt = text[-500:]  # 用末尾500字作为下段衔接
+    # 第一次：完整章节
+    text1 = call_minimax(prompt, system, max_tokens=1800)
+    if text1 and len(text1.strip()) > 50:
+        chunks.append(text1)
+        char_count = sum(1 for c in text1 if '\u4e00' <= c <= '\u9fff')
+        print(f"[LLM] 第1段: {char_count} 字")
 
-    full = "\n".join(chunks)
-    return full
+        # 如果字数还不够，写续写
+        if char_count < target_chars:
+            continuation_prompt = f"""前文内容（约{char_count}字），请续写来达到约{target_chars}字。
+要求：
+- 自然衔接上文
+- 不重复已有内容
+- 保持节奏紧凑
+- 继续推进剧情
+
+前文末尾（最后200字）：
+{text1[-200:]}
+
+请续写："""
+            text2 = call_minimax(continuation_prompt, system, max_tokens=1800)
+            if text2 and len(text2.strip()) > 50:
+                chunks.append(text2)
+                char2 = sum(1 for c in text2 if '\u4e00' <= c <= '\u9fff')
+                print(f"[LLM] 第2段: {char2} 字")
+
+    return "\n".join(chunks)
 
 
 def count_chinese_chars(text: str) -> int:
