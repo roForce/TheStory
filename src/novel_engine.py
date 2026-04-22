@@ -74,22 +74,23 @@ def call_minimax(prompt: str, system: Optional[str] = None, max_tokens: int = 18
 
 def generate_long_text(prompt: str, system: Optional[str] = None, min_chars: int = 4000) -> str:
     """
-    生成长文本（多段拼接），确保达到最低字数
-    MiniMax M2.7 单次约1000-2100中文字，分2-3次调用
+    尝试单次高 token 生成（3000 tokens ≈ 5000+ 中文字，约70s）
+    若字数不够，再补一段续写
     """
     target_chars = max(min_chars, 4200)
-    chunks = []
 
-    # 第一次：完整章节
-    text1 = call_minimax(prompt, system, max_tokens=1800)
+    # 第一次：单次高token生成（减少调用次数）
+    # MiniMax M2.7 内部限制约 1800-2200 tokens 输出，3000 可覆盖 4000+ 中文
+    text1 = call_minimax(prompt, system, max_tokens=3000)
     if text1 and len(text1.strip()) > 50:
-        chunks.append(text1)
         char_count = sum(1 for c in text1 if '\u4e00' <= c <= '\u9fff')
         print(f"[LLM] 第1段: {char_count} 字")
 
-        # 如果字数还不够，写续写
-        if char_count < target_chars:
-            continuation_prompt = f"""前文内容（约{char_count}字），请续写来达到约{target_chars}字。
+        if char_count >= target_chars:
+            return text1
+
+        # 字数不够，续写
+        continuation_prompt = f"""前文内容（约{char_count}字），请续写来达到约{target_chars}字。
 要求：
 - 自然衔接上文
 - 不重复已有内容
@@ -100,13 +101,14 @@ def generate_long_text(prompt: str, system: Optional[str] = None, min_chars: int
 {text1[-200:]}
 
 请续写："""
-            text2 = call_minimax(continuation_prompt, system, max_tokens=1800)
-            if text2 and len(text2.strip()) > 50:
-                chunks.append(text2)
-                char2 = sum(1 for c in text2 if '\u4e00' <= c <= '\u9fff')
-                print(f"[LLM] 第2段: {char2} 字")
+        text2 = call_minimax(continuation_prompt, system, max_tokens=1800)
+        if text2 and len(text2.strip()) > 50:
+            char2 = sum(1 for c in text2 if '\u4e00' <= c <= '\u9fff')
+            print(f"[LLM] 第2段: {char2} 字")
+            return text1 + "\n\n" + text2
+        return text1
 
-    return "\n".join(chunks)
+    return ""
 
 
 def count_chinese_chars(text: str) -> int:
