@@ -1,11 +1,13 @@
 """
 小说生成引擎
 基于热点元素，自我迭代，生成符合市场需求的小说章节
+使用 MiniMax M2.7 API（从 auth.json 读取密钥）
 """
 
 import json
 import re
 import os
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -13,12 +15,91 @@ from typing import Optional
 CHAPTERS_DIR = Path(__file__).parent.parent / "chapters"
 MARKET_FILE = Path(__file__).parent.parent / "market_data" / "market_latest.json"
 SKILLS_DIR = Path(__file__).parent.parent / "skills"
-
-# 每章最少字数
 MIN_CHARS_PER_CHAPTER = 4000
+MAX_TOKENS_PER_CALL = 2000  # MiniMax M2.7 每次最多输出 token 数
 
-# 全书最少字数
-MIN_TOTAL_CHARS = 10000
+
+def _load_minimax_credentials() -> tuple[str, str]:
+    """从 auth.json 读取 MiniMax CN 凭证"""
+    auth_path = Path.home() / ".hermes" / "auth.json"
+    with open(auth_path, encoding="utf-8") as f:
+        data = json.load(f)
+    creds = data["credential_pool"]["minimax-cn"][0]
+    return creds["access_token"], creds["base_url"]
+
+
+def call_minimax(prompt: str, system: Optional[str] = None, max_tokens: int = 2000) -> str:
+    """调用 MiniMax M2.7（Anthropic 兼容格式），返回文本"""
+    key, base_url = _load_minimax_credentials()
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": "MiniMax-M2.7",
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "thinking": {"type": "disabled"},
+    }
+
+    curl_cmd = [
+        "curl", "-s", "--max-time", "180",
+        "-X", "POST",
+        f"{base_url}/v1/messages",
+        "-H", f"Authorization: Bearer {key}",
+        "-H", "Content-Type: application/json",
+        "-H", "anthropic-version: 2023-06-01",
+        "-d", json.dumps(payload),
+    ]
+
+    try:
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=200)
+        if result.returncode != 0:
+            print(f"[LLM] curl failed: {result.stderr[:100]}")
+            return ""
+        resp = json.loads(result.stdout)
+        content = resp.get("content", [])
+        for block in content:
+            if block.get("type") == "text":
+                return block["text"]
+        # fallback: 尝试直接从 resp 提取
+        return ""
+    except subprocess.TimeoutExpired:
+        print("[LLM] MiniMax 调用超时")
+        return ""
+    except Exception as e:
+        print(f"[LLM] MiniMax 调用失败: {e}")
+        return ""
+
+
+def generate_long_text(prompt: str, system: Optional[str] = None, min_chars: int = 4000) -> str:
+    """
+    生成长文本（多段拼接），确保达到最低字数
+    MiniMax M2.7 单次 max_tokens=2000（约1500-2000中文字），分3次调用
+    """
+    target_chars = max(min_chars, 4500)
+    chunks = []
+    remaining_chars = target_chars + 500
+
+    max_calls = 4
+    for i in range(max_calls):
+        # 追加提示，让模型继续写
+        continuation = "" if i == 0 else "\n\n[请继续上述内容，自然衔接，延续剧情]"
+        text = call_minimax(prompt + continuation, system, max_tokens=MAX_TOKENS_PER_CALL)
+        if not text or len(text.strip()) < 20:
+            break
+        chunks.append(text)
+        prompt = text[-500:]  # 用末尾500字作为下段衔接
+
+    full = "\n".join(chunks)
+    return full
+
+
+def count_chinese_chars(text: str) -> int:
+    """统计中文字符数（不含标点空格）"""
+    return len(re.findall(r'[\u4e00-\u9fff]', text))
 
 
 def load_market_data() -> dict:
@@ -41,25 +122,26 @@ def build_chapter_prompt(
     story_outline: dict,
     previous_summary: str,
     writing_tips: list[str],
-) -> str:
-    """构建章节写作提示词"""
-
+) -> tuple[str, str]:
+    """构建章节写作提示词，返回 (system, prompt)"""
     word_target = max(MIN_CHARS_PER_CHAPTER, 4500)
 
-    prompt = f"""你是资深网络小说作家，精通{genre}类型小说创作。
+    system = f"""你是资深网络小说作家，精通{genre}类型小说创作。
+写作要求：
+- 每800字设置一个小高潮，每2000字一个大悬念
+- 主角每章至少做一件有性格的事
+- 对话要推动剧情，不写废话对话
+- 描写简洁有力，避免过度环境描写
+- 章节字数不少于{word_target}字
+- 禁止水文、禁止凑字数
+- 中文写作，语言生动，符合网文读者习惯"""
 
-【本章要求】
-- 章节序号：第{chapter_num}章（共{total_chapters}章）
-- 字数要求：不少于{word_target}字
-- 写作风格：快节奏、高潮迭起、人物立体、对话生动
-- 必须包含：冲突/转折/悬念，吸引读者追读
-
-【市场热点参考】
-- 当前热门类型：{', '.join(themes[:5])}
-- 热门写法：{', '.join(story_outline.get('trends', [])[:5])}
+    prompt = f"""【当前市场热点参考】
+热门类型：{', '.join(themes[:5])}
+热门写法：{', '.join(story_outline.get('trends', [])[:5])}
 
 【本书设定】
-- 书名：《{story_outline.get('title', '未命名')}》
+- 书名：{story_outline.get('title', '未命名')}
 - 主线：{story_outline.get('main_plot', '待补充')}
 - 核心冲突：{story_outline.get('core_conflict', '待补充')}
 - 主角：{story_outline.get('protagonist', '待补充')}
@@ -71,192 +153,101 @@ def build_chapter_prompt(
 【写作技巧】
 {chr(10).join(f'- {tip}' for tip in writing_tips[:3])}
 
-请开始创作第{chapter_num}章，要求：
+请创作第{chapter_num}章，要求：
 1. 开篇直接切入剧情，不要写"章节名"
 2. 章节内要有明确的冲突推进
-3. 结尾留有悬念或钩子
-4. 禁止水文、禁止凑字数
-5. 中文写作，语言生动，符合网文读者习惯
+3. 结尾留有悬念或钩子，吸引读者追读
+4. 不少于{word_target}字，节奏紧凑
 
-请输出完整章节内容："""
-    return prompt
+请输出完整第{chapter_num}章内容："""
+    return system, prompt
 
 
-def build_outline_prompt(market: dict) -> str:
+def build_outline_prompt(market: dict) -> tuple[str, str]:
     """构建大纲提示词"""
     hot_types = market.get("top_5", ["都市", "穿越", "玄幻"])
     trends = market.get("trends", ["系统流", "快节奏"])
     genres = market.get("genres", ["都市言情", "玄幻修仙"])
 
-    prompt = f"""你是资深网文策划，精通市场需求和读者心理。
+    system = "你是一个资深网文策划专家，精通市场需求和读者心理，只输出JSON格式。"
 
-【当前市场热点】
+    prompt = f"""当前市场热点：
 热门类型：{', '.join(hot_types)}
 热门写法：{', '.join(trends)}
 热门题材：{', '.join(genres)}
 
-【任务】
 请设计一部小说的完整大纲，要求：
-1. 题材要契合当前市场热点
-2. 类型选择市场验证过的热门类型
-3. 开篇要有强冲突/强悬念/强金手指
-4. 前10章必须有明确的高潮点
-5. 主角要有成长曲线和鲜明性格
-6. 设定要有新意，避免老套
+1. 题材契合当前市场热点
+2. 开篇要有强冲突/强悬念/强金手指
+3. 前10章必须有明确的高潮点
+4. 主角要有成长曲线和鲜明性格
+5. 设定要有新意，避免老套
 
-请输出JSON格式大纲：
+输出严格JSON格式（不要有任何其他内容）：
 {{
     "title": "书名（新颖有吸引力）",
     "genre": "题材类型",
     "setting": "世界观/背景设定",
-    "protagonist": "主角人设（姓名+性格+背景+金手指）",
+    "protagonist": "主角人设",
     "core_conflict": "核心冲突",
     "main_plot": "主线剧情概述",
-    "chapters_plan": "各章节核心事件（至少5章，每章一句）",
     "selling_points": ["卖点1", "卖点2", "卖点3"],
-    "target_readers": "目标读者群体",
-    "word_count_target": "计划总字数"
+    "target_readers": "目标读者群体"
 }}"""
-    return prompt
+    return system, prompt
 
 
-def count_chinese_chars(text: str) -> int:
-    """统计中文字符数（不含标点空格）"""
-    chars = re.findall(r'[\u4e00-\u9fff]', text)
-    return len(chars)
-
-
-def call_llm(prompt: str, system: Optional[str] = None) -> str:
-    """调用 LLM 生成内容"""
-    import os
-
-    # 优先使用 MiniMax API（当前 Agent 所在平台）
-    api_key = os.environ.get("MINIMAX_API_KEY", "")
-    model = os.environ.get("MINIMAX_MODEL", "MiniMax-Text-01")
-
-    if not api_key:
-        # 尝试使用 OpenAI
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-
-    if not api_key:
-        # 使用 Nous/自有端点
-        api_key = os.environ.get("NOUS_API_KEY", "")
-        model = os.environ.get("NOUS_MODEL", "NousResearch/Hermes-3-Llama-3.1-8B")
-
-    if not api_key:
-        return generate_fallback_chapter(prompt)
-
-    # 调用 MiniMax API
-    if "minimax" in model.lower() or "MiniMax" in model:
-        return call_minimax(prompt, system, api_key, model)
-
-    return call_openai_compatible(prompt, system, api_key, model)
-
-
-def call_minimax(prompt: str, system: Optional[str], api_key: str, model: str) -> str:
-    """调用 MiniMax API"""
-    import urllib.request
-    import urllib.parse
-
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-
-    data = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.85,
-        "max_tokens": 8192,
-    }
-
-    req = urllib.request.Request(
-        "https://api.minimax.chat/v1/text/chatcompletion_pro?GroupId="
-        + os.environ.get("MINIMAX_GROUP_ID", ""),
-        data=json.dumps(data).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        },
-        method="POST"
-    )
-
+def parse_outline(text: str) -> dict:
+    """从 LLM 输出中解析 JSON 大纲"""
+    text = text.strip()
+    # 尝试提取 ```json ... ``` 或 ``` ... ```
+    import re
+    m = re.search(r'```(?:json)?\s*([\s\S]+?)```', text)
+    if m:
+        text = m.group(1)
+    else:
+        # 尝试找 { ... }
+        m = re.search(r'\{[\s\S]+\}', text)
+        if m:
+            text = m.group(0)
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            return result["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"[LLM] MiniMax 调用失败: {e}")
-        return ""
+        return json.loads(text)
+    except json.JSONDecodeError:
+        print(f"[大纲] JSON解析失败: {text[:200]}")
+        return None
 
 
-def call_openai_compatible(prompt: str, system: Optional[str], api_key: str, model: str) -> str:
-    """调用 OpenAI 兼容 API"""
-    import urllib.request
+def generate_outline(market: dict) -> dict:
+    """生成小说大纲"""
+    system, prompt = build_outline_prompt(market)
+    text = call_minimax(prompt, system=system, max_tokens=1500)
+    if not text:
+        print("[大纲] 生成失败，使用默认大纲")
+        return get_default_outline()
+    outline = parse_outline(text)
+    if not outline:
+        return get_default_outline()
+    return outline
 
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
 
-    # 检测 base URL
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    data = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.85,
-        "max_tokens": 8192,
+def get_default_outline() -> dict:
+    """默认大纲（市场最热题材组合）"""
+    return {
+        "title": "都市最强系统",
+        "genre": "都市异能·系统流",
+        "setting": "现代都市，灵气复苏时代",
+        "protagonist": "陆子昂，普通程序员，意外获得「人生重开系统」，每晚凌晨可重开一次人生",
+        "core_conflict": "利用系统重开优势，在都市中步步崛起，但每次重开都会失去一段记忆",
+        "main_plot": "主角利用系统重开积累优势，创建商业帝国，同时揭开系统背后的惊天秘密",
+        "selling_points": ["系统流+都市", "快节奏", "不断反转", "悬念密集", "主角智商在线"],
+        "target_readers": "18-35岁男性，喜欢快节奏爽文",
     }
-
-    url = f"{base_url.rstrip('/')}/chat/completions"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(data).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        },
-        method="POST"
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            return result["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"[LLM] OpenAI兼容调用失败: {e}")
-        return ""
-
-
-def generate_fallback_chapter(prompt: str) -> str:
-    """无 API 时的占位章节生成（基于规则）"""
-    # 这是一个简化版，实际部署时必须接入真实 LLM
-    return f"""
-【本章为自动生成占位内容】
-
-由于未配置 LLM API，本章为占位内容。
-
-要启用真实写作功能，请设置以下环境变量之一：
-- MINIMAX_API_KEY + MINIMAX_GROUP_ID
-- OPENAI_API_KEY + OPENAI_BASE_URL
-- NOUS_API_KEY
-
-当前热点关键词：{load_market_data().get('top_5', ['都市', '穿越'])}
-"""
-
-
-def write_outline_to_file(outline: dict, path: Path):
-    """将大纲写入文件"""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(outline, f, ensure_ascii=False, indent=2)
 
 
 def generate_novel(outline: dict, market: dict, chapter_num: int, previous_summary: str) -> dict:
     """生成单章小说"""
     print(f"[生成] 开始生成第{chapter_num}章...")
 
-    total_ch = max(10, chapter_num + 5)
     writing_tips = [
         "每800字设置一个小高潮，每2000字一个大悬念",
         "主角每章至少做一件有性格的事",
@@ -264,9 +255,9 @@ def generate_novel(outline: dict, market: dict, chapter_num: int, previous_summa
         "描写简洁有力，避免过度环境描写",
     ]
 
-    prompt = build_chapter_prompt(
+    system, prompt = build_chapter_prompt(
         chapter_num=chapter_num,
-        total_chapters=total_ch,
+        total_chapters=max(10, chapter_num + 5),
         genre=outline.get("genre", "都市言情"),
         themes=market.get("top_5", []),
         story_outline=outline,
@@ -274,33 +265,34 @@ def generate_novel(outline: dict, market: dict, chapter_num: int, previous_summa
         writing_tips=writing_tips,
     )
 
-    content = call_llm(prompt)
+    # 生成长文本（多段拼接）
+    content = generate_long_text(prompt, system=system, min_chars=MIN_CHARS_PER_CHAPTER)
 
-    if not content or len(content) < 100:
+    if not content or len(content.strip()) < 100:
         print(f"[生成] LLM 返回内容过短，使用占位内容")
-        content = generate_fallback_chapter(prompt)
+        content = _generate_placeholder_chapter(chapter_num, outline)
 
     char_count = count_chinese_chars(content)
+    print(f"[生成] 第{chapter_num}章完成，约 {char_count} 中文字符")
 
-    # 强制补字数（如果不够）
+    # 字数不足时续写
     if char_count < MIN_CHARS_PER_CHAPTER:
         shortfall = MIN_CHARS_PER_CHAPTER - char_count
-        extension_prompt = f"""
-前文内容字数不足{shortfall}字，请续写一段来扩充内容，续写要求：
-- 延续当前剧情
+        extension_prompt = f"""前文内容字数不足，还需再写约{shortfall}字来扩充内容。
+续写要求：
+- 延续当前剧情，自然过渡
 - 不重复已有内容
-- 自然过渡，不生硬
-- 续写内容不少于{shortfall}字
+- 保持节奏紧凑
 
-前文：
-{content[-1000:]}
-"""
-        extension = call_llm(extension_prompt)
+前文末尾：
+{content[-800:]}
+
+请续写："""
+        extension = call_minimax(extension_prompt, system=system, max_tokens=MAX_TOKENS_PER_CALL)
         if extension and len(extension) > 50:
             content += "\n\n" + extension
             char_count = count_chinese_chars(content)
-
-    print(f"[生成] 第{chapter_num}章完成，约 {char_count} 中文字符")
+            print(f"[生成] 续写后字数: {char_count}")
 
     return {
         "chapter_num": chapter_num,
@@ -310,7 +302,22 @@ def generate_novel(outline: dict, market: dict, chapter_num: int, previous_summa
     }
 
 
-def save_chapter(chapter_data: dict, story_id: str, chapter_num: int, base_dir: Path):
+def _generate_placeholder_chapter(chapter_num: int, outline: dict) -> str:
+    """占位章节（API 不可用时）"""
+    return f"""
+第{chapter_num}章
+
+【系统提示】
+LLM API 当前不可用，此为占位内容。
+书名：{outline.get('title', '未命名')}
+类型：{outline.get('genre', '都市')}
+设定：{outline.get('setting', '')}
+
+请配置有效的 LLM API 密钥以生成真实小说内容。
+"""
+
+
+def save_chapter(chapter_data: dict, story_id: str, chapter_num: int, base_dir: Path) -> Path:
     """保存章节到文件"""
     story_dir = base_dir / story_id
     story_dir.mkdir(exist_ok=True)
@@ -343,29 +350,22 @@ def build_full_novel(story_id: str, base_dir: Path) -> Path:
     for cf in chapter_files:
         with open(cf, encoding="utf-8") as f:
             content = f.read()
-        # 去掉元信息头部
         lines = content.split("\n")
-        if "=" in content:
-            sep_idx = next((i for i, l in enumerate(lines) if "=" in l), 0)
-            content = "\n".join(lines[sep_idx + 1:])
+        sep_idx = next((i for i, l in enumerate(lines) if "=" in l), 0)
+        body = "\n".join(lines[sep_idx + 1:])
 
-        full_content.append(f"\n\n{'='*50}\n{cf.stem.replace('chapter_', '第').replace('_', '章')}\n{'='*50}\n\n")
-        full_content.append(content)
+        ch_num = int(cf.stem.split("_")[1].lstrip("0") or "1")
+        full_content.append(f"\n\n{'='*50}\n第{ch_num}章\n{'='*50}\n\n")
+        full_content.append(body)
 
-        # 统计
-        char_count = count_chinese_chars(content)
-        meta["chapters"].append({
-            "file": cf.name,
-            "chars": char_count,
-        })
+        char_count = count_chinese_chars(body)
+        meta["chapters"].append({"file": cf.name, "chars": char_count})
         meta["total_chars"] += char_count
 
-    # 写入全文
     full_file = story_dir / "full_novel.txt"
     with open(full_file, "w", encoding="utf-8") as f:
         f.write("\n".join(full_content))
 
-    # 写入元数据
     meta_file = story_dir / "meta.json"
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -380,8 +380,9 @@ def create_new_story(outline: dict, market: dict, story_id: str) -> dict:
     story_dir = CHAPTERS_DIR / story_id
     story_dir.mkdir(exist_ok=True, parents=True)
 
-    # 保存大纲
-    write_outline_to_file(outline, story_dir / "outline.json")
+    outline_file = story_dir / "outline.json"
+    with open(outline_file, "w", encoding="utf-8") as f:
+        json.dump(outline, f, ensure_ascii=False, indent=2)
 
     result = generate_novel(outline, market, 1, "【新书开篇，无前章】")
     save_chapter(result, story_id, 1, CHAPTERS_DIR)
@@ -398,15 +399,13 @@ def update_story_chapter(story_id: str, outline: dict, market: dict, chapter_num
     """更新指定章节"""
     story_dir = CHAPTERS_DIR / story_id
 
-    # 获取前章概要
     prev_summary = ""
     if chapter_num > 1:
         prev_file = story_dir / f"chapter_{chapter_num-1:03d}.txt"
         if prev_file.exists():
             with open(prev_file, encoding="utf-8") as f:
                 prev_text = f.read()
-            # 提取最后500字作为前章概要
-            prev_summary = prev_text[-800:] if len(prev_text) > 800 else prev_text
+            prev_summary = prev_text[-600:] if len(prev_text) > 600 else prev_text
 
     result = generate_novel(outline, market, chapter_num, prev_summary)
     save_chapter(result, story_id, chapter_num, CHAPTERS_DIR)
@@ -428,8 +427,8 @@ def get_story_progress(story_id: str) -> dict:
         with open(meta_path, encoding="utf-8") as f:
             meta = json.load(f)
 
-    outline_path = story_dir / "outline.json"
     outline = {}
+    outline_path = story_dir / "outline.json"
     if outline_path.exists():
         with open(outline_path, encoding="utf-8") as f:
             outline = json.load(f)

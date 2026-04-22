@@ -11,6 +11,21 @@ from pathlib import Path
 
 MARKET_DATA_DIR = Path(__file__).parent.parent / "market_data"
 MARKET_DATA_DIR.mkdir(exist_ok=True)
+MARKET_LATEST = MARKET_DATA_DIR / "market_latest.json"
+
+
+def load_market_data() -> dict:
+    """加载最新市场数据（供其他模块调用）"""
+    if not MARKET_LATEST.exists():
+        return {
+            "top_5": ["都市", "穿越", "玄幻", "甜宠", "悬疑"],
+            "trends": ["系统流", "快节奏", "日常流"],
+            "genres": ["都市言情", "玄幻修仙"],
+            "keywords": [],
+            "total_keywords": 0,
+        }
+    with open(MARKET_LATEST, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def get_source_name(url_or_platform: str) -> str:
