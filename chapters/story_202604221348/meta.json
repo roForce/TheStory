@@ -28,7 +28,11 @@
     {
       "file": "chapter_007.txt",
       "chars": 5014
+    },
+    {
+      "file": "chapter_008.txt",
+      "chars": 2549
     }
   ],
-  "total_chars": 20611
+  "total_chars": 23160
 }
