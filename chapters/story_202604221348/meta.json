@@ -56,7 +56,11 @@
     {
       "file": "chapter_014.txt",
       "chars": 2561
+    },
+    {
+      "file": "chapter_015.txt",
+      "chars": 2704
     }
   ],
-  "total_chars": 50079
+  "total_chars": 52783
 }
