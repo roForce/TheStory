@@ -99,3 +99,13 @@
 [2026-04-25 22:33:01] [更新] 继续故事 story_202604221348，生成第 16 章...
 [2026-04-26 00:18:23] [更新] 继续故事 story_202604221348，生成第 16 章...
 [2026-04-26 06:01:29] [更新] 继续故事 story_202604221348，生成第 16 章...
+[2026-04-26 06:18:38] [Git] 已提交: story_202604221348
+[2026-04-26 06:18:46] [Git] 推送失败: fatal: unable to access 'https://github.com/roForce/TheStory.git/': LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443 
+
+[2026-04-26 06:18:48] [Git] 推送失败: Host key verification failed.
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+
+[2026-04-26 06:18:48] [完成] 故事 story_202604221348 第 16 章已更新并推送
